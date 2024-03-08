@@ -1,0 +1,538 @@
+---
+title: "RScript_LucaBraunger_miRNALRRK2project"
+author: "Luca Braunger"
+date: "2024-01-30"
+output: BiocStyle::html_document
+---
+
+# Used packages
+
+```{r, message=F, warning = F}
+library(data.table) 
+library(tidyverse)
+library(tibble)
+library(ggfortify)
+library(patchwork)
+library(dplyr)
+library(stringi)
+library(stringr)
+library(pheatmap) 
+library(ggplotify)
+library(heatmaply)
+library(rmarkdown)
+library(viridis)
+library(gplots)
+library(ComplexHeatmap)
+library(DescTools)
+library(randomForest)
+library(caret) 
+library(glmnet)
+
+```
+
+# Data Preprocessing
+
+```{r, message = F}
+## input format: long format table with 4 columns: "Target", "patient", "Cq", "plate", "group", "matchinggroup"
+
+dtlongproc <- fread("plasma_long.csv", header = T)
+dtlongproc[,"Cq" := gsub(",", ".", dtlongproc$"Cq")] #Change separator from "," to "."
+dtlongproc[,patient := as.numeric(patient)]
+dtlongproc[,Cq := as.numeric(Cq)]
+dtlongproc[,plate := as.numeric(plate)]
+dtlongproc[,group := as.factor(group)]
+dtlongproc[,matchinggroup := as.factor(matchinggroup)]
+
+
+# Exclude Ct values > 45
+for (i in 1:(nrow(dtlongproc))){
+  if(dtlongproc[i,"Cq"] == 0){
+    dtlongproc[i,"Cq"] <- 45
+  }
+}
+for (i in 1:(nrow(dtlongproc))){
+  if(dtlongproc[i,"Cq"] > 40){
+    dtlongproc[i,"Cq"] <- NA
+  }
+}
+
+
+##Data Calibration with UniSpike3 --> correction for interplate differences
+dt_UniSp3_plasma <- dtlongproc [dtlongproc$Target == "UniSP3",] #put all UniSp3 rows in new dt to calculate global mean
+globalmeanUni3_plasma <- mean(dt_UniSp3_plasma$Cq)
+dt_UniSp3meaned_plasma <- group_by(dt_UniSp3_plasma, Target, plate)%>%    #summarize UniSp3 rows of 1 plate into 1 row
+  dplyr::summarise(Cq=mean(Cq)) %>% 
+  dplyr::rename( norm = Cq) %>%
+  subset(select=c(plate,norm))
+dtlongprefinal_plasma <- left_join(dtlongproc, dt_UniSp3meaned_plasma, by="plate") %>% #join UniSp3 values to original dt by plate, calculate callibration
+ mutate(Cq_norm = Cq - (norm - globalmeanUni3_plasma))
+
+```
+
+# Calculate delta Ct: sample Cq vs mean Cq of all miRNAs of this patient
+
+```{r, warning = F, message = F}
+##Subtract Cq from mean Cq for delta Cq
+
+## function to summarize values of one plate into one row
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+
+dt_MEAN_plasma <- dtlongprefinal_plasma ## create new dataframe with data from other df
+dt_MEAN_plasma <- filter(dt_MEAN_plasma, Target != "UniSp2" & Target != "UniSP3" & Target != "UniSp4" & Target != "UniSp6") ## delete all rows with Spike ins
+dt_MEAN_plasma <- filter(dt_MEAN_plasma, Cq != 45) ## delete all rows with Cq 45
+dt_MEAN_plasma <- data_summary(dt_MEAN_plasma, varname="Cq_norm",
+                    groupnames=c( "patient"))
+dt_MEAN_plasma <- dt_MEAN_plasma %>%
+  dplyr::rename( meanE = Cq_norm) %>%
+  subset(select=c(patient,meanE))
+
+dtlongfinal2_plasma <- left_join(dtlongprefinal_plasma, dt_MEAN_plasma, by="patient") %>% ##join mean expression values to original dt, calculate dCq
+  mutate(dCq = Cq_norm - meanE)
+
+```
+
+# Calculate ddcq (Patient vs. mean of Healthy controls)
+
+```{r}
+dtlongfinal2_plasma$ddCqmean <- 0
+dt_healthy_plasma <- dtlongfinal2_plasma[dtlongfinal2_plasma$group == "HC",]
+dt_healthy_plasma <- na.omit(dt_healthy_plasma)
+dt_healthy_plasma <- group_by(dt_healthy_plasma, Target)%>%
+  dplyr::summarise(dCq=mean(dCq))%>%
+  dplyr::rename(dCq_healthymean = dCq)
+
+dtlongfinal3_plasma <- left_join(dtlongfinal2_plasma, dt_healthy_plasma, by = "Target")%>%
+  mutate(ddCqmean = dCq - dCq_healthymean)
+```
+
+
+# Calculate fold change and log2fc
+```{r}
+##fc = 2^(-ddcq)
+##log2fc = log2(fc)
+
+dtlongfinal3_plasma <- dtlongfinal3_plasma  %>% ##calculate fc
+  mutate(fc = 2^(-ddCqmean))%>%
+  mutate(log2fc = log2(fc))
+dtlongfinal3_plasma <- dtlongfinal3_plasma[order(group)]
+
+paged_table(dtlongfinal3_plasma)
+
+```
+
+# Heatmap
+
+## Data Preparation
+```{r}
+#### drop: BlankSpot and Spike Ins, select patients
+
+
+#fold change data
+dt_plot_run124_plasma <- dtlongfinal3_plasma [dtlongfinal3_plasma$Target != "BlankSpot" & dtlongfinal3_plasma$Target != "UniSP3" & dtlongfinal3_plasma$Target != "UniSp2" & dtlongfinal3_plasma$Target != "UniSp4" & dtlongfinal3_plasma$Target != "UniSp6" 
+                                              & dtlongfinal3_plasma$Target != "hsa-miR-198"
+                                              & dtlongfinal3_plasma$group != "HC" 
+                                              & dtlongfinal3_plasma$patient != 19 #patient excluded
+                                              & dtlongfinal3_plasma$patient != 25 #patient excluded
+                                              ,]
+
+dtplot_forspread_plasma = data.table(
+  Target = dt_plot_run124_plasma$Target,
+  patient = dt_plot_run124_plasma$patient,
+  fc = dt_plot_run124_plasma$log2fc
+)
+
+dtplot_wide_plasma <- dtplot_forspread_plasma %>%
+  mutate(patient=factor(patient, levels = unique(patient))) %>%
+  spread(patient, fc)
+
+dtplot_wide_plasma <- column_to_rownames(dtplot_wide_plasma, var = "Target")
+
+
+#calibrated Cq Data
+dt_plot124_cq_plasma <- dtlongfinal3_plasma [dtlongfinal3_plasma$Target != "BlankSpot" & dtlongfinal3_plasma$Target != "UniSP3" & dtlongfinal3_plasma$Target != "UniSp2" & dtlongfinal3_plasma$Target != "UniSp4" & dtlongfinal3_plasma$Target != "UniSp6" 
+                                             & dtlongfinal3_plasma$Target != "hsa-miR-198"
+                                             & dtlongfinal3_plasma$patient != 19 #patient excluded
+                                             & dtlongfinal3_plasma$patient != 25 #patient excluded
+                                             ,]
+dtplot_cq_plasma = data.table(
+  Target = dt_plot124_cq_plasma$Target,
+  patient = dt_plot124_cq_plasma$patient,
+  Cq = dt_plot124_cq_plasma$Cq_norm
+)
+
+dtplot_cq_forspread_plasma <- dtplot_cq_plasma
+
+dtplot_cq_wide_plasma <- dtplot_cq_forspread_plasma %>%
+  mutate(patient=factor(patient, levels = unique(patient))) %>%
+  spread(patient, Cq)
+dtplot_cq_wide_plasma <- column_to_rownames(dtplot_cq_wide_plasma, var = "Target")
+
+
+
+
+#miRNA selection:  delete miRNAs that have Cq >44.5 in at least X patients 
+
+keep2  <- rowSums(is.na(dtplot_cq_wide_plasma)) <= 1 ## Cq
+dtplot_cq_wide_plasma <- dtplot_cq_wide_plasma[keep2,]
+
+dtplot_wide_plasma <- dtplot_wide_plasma[keep2,] ## Fc
+
+
+
+#Apply miRNA selection on longformat table for following analysis
+dtlong_selected <- dtlongfinal3_plasma
+selected_miRNAs <- rownames(dtplot_cq_wide_plasma)
+
+dtlong_selected <- dtlong_selected[dtlong_selected$Target %in% selected_miRNAs, ]
+
+
+```
+
+## Heatmap setup
+
+```{r}
+
+##Fc Data
+heatmapdt_plasma <-  as.matrix(dtplot_wide_plasma)
+data_norm_plasma <- t(scale(t(heatmapdt_plasma), center = TRUE, scale = TRUE))
+
+colnames(data_norm_plasma) = c("22: asymp", "28: asymp", "31:asymp",  "1: G2019S", "4: G2019S", "7: R1441C", "10: I2020T", "13: G2019S", "16: G2019S", "2: sPD", "5: sPD", "8: sPD", "11: sPD", "14: sPD", "17: sPD", "20: sPD", "23: sPD", "26: sPD", "29: sPD")
+annotation_col_plasma = data.frame(
+    group = factor(rep(c("asymptomatic",  "LRRK2 PD", "sporadic PD"), c(3,6,10)))
+)
+rownames(annotation_col_plasma) = colnames(data_norm_plasma)
+ann_colors_plasma = list(
+    group = c("asymptomatic" = "#88aed4",  "sporadic PD" = "#E23126", "LRRK2 PD" = "#0C5196")
+)
+
+
+##Cq Data
+heatmapdt_cq_plasma <-  as.matrix(dtplot_cq_wide_plasma) 
+data_norm_cq_plasma <- t(scale(t(heatmapdt_cq_plasma)))
+
+colnames(data_norm_cq_plasma) = c("22: asymp", "28: asymp", "31:asymp", "1: G2019S", "4: G2019S", "7: R1441C", "10: I2020T", "13: G2019S", "16: G2019S", "3: HC", "6: HC", "9: HC", "12: HC", "15: HC", "18: HC", "21: HC", "24: HC", "27: HC", "30: HC", "32: HC", "2: sPD", "5: sPD", "8: sPD", "11: sPD", "14: sPD", "17: sPD", "20: sPD", "23: sPD", "26: sPD", "29: sPD")
+annotation_col_cq_plasma = data.frame(
+    group = factor(rep(c("asymptomatic", "fPD", "HC", "sPD"), c(3, 6,11,10)))
+)
+
+rownames(annotation_col_cq_plasma) = colnames(data_norm_cq_plasma)
+ann_colors_cq_plasma = list(
+    group = c("asymptomatic" = "#88aed4", "sPD" = "#E23126", "fPD" = "#0C5196", "HC" = "#bbbbbb")
+)
+
+```
+
+## Heatmaps
+```{r, warning = FALSE}
+##heatmap log2fc
+
+pheatmap(data_norm_plasma,  
+         legend_breaks = c(-3.95, 0 ,3.95),
+         column_split = c(rep(c("asymp"),3),rep(c("fPD"),6), rep(c("sPD"),10)),
+         cluster_rows = T,
+         cluster_cols = T,
+         annotation_col = annotation_col_plasma, 
+         annotation_colors = ann_colors_plasma,
+         legend_labels = c("min", "mid", "max"),
+         fontsize = 13,
+         cellheight = 1.7,
+         cellwidth = 9,
+         border_color = NA,
+         fontsize_row = 3,
+         display_numbers = F,
+         show_rownames = F,
+         show_colnames = F,
+         breaks = seq(-2.25, 2.25, by = 0.5),
+         treeheight_col = 20,
+         treeheight_row = 22,
+         heatmap_legend_param = list(
+              title = "normalized \nlog2 foldchange",
+              legend_height = unit(2, "cm")
+              #title_position = "lefttop-rot"
+          )
+         )
+```
+
+```{r}
+## heatmap Ct values
+pheatmap(data_norm_cq_plasma,  
+         legend_breaks = c(-4, 0, 4),
+         column_split = c(rep(c("asymp"),3),rep(c("fPD"),6),rep(c("HC"),11) ,rep(c("sPD"),10)),
+         cluster_rows = T,
+         cluster_cols = F,
+         annotation_col = annotation_col_cq_plasma, 
+         annotation_colors = ann_colors_cq_plasma,
+         main="",
+         legend_labels = c("max", "mid", "min"),
+         fontsize = 10,
+         cellheight = 3,
+         cellwidth = 15,
+         border_color = NA,
+         fontsize_row = 3,
+         display_numbers = F,
+         show_rownames = F,
+         show_colnames = F,
+         heatmap_legend_param = list(
+              title = "expression",
+              legend_height = unit(3, "cm")
+          )
+         ) 
+```
+
+# t-test
+
+```{r, message=F}
+## get data
+ttest_data <- dtlong_selected %>%
+  select(Target, patient, group, log2fc)
+
+ttest_data <- ttest_data[ttest_data$group != "HC",]
+
+#exclusion of outlier
+ttest_data <- ttest_data[ttest_data$patient != "25",]
+
+
+##count asymp patients in fPD group
+ttest_data <- ttest_data %>%
+  mutate(group = case_when(
+    group == "asymp" ~ "fPD",
+    TRUE ~ group
+  ))
+
+ttest_data$patient <- as.factor(ttest_data$patient)
+ttest_data$log2fc <- as.numeric(ttest_data$log2fc)
+ttest_data$group <- as.factor(ttest_data$group)
+
+#calculate mean log2fc with SD 
+means <- ttest_data %>%
+  group_by(Target, group) %>%
+  dplyr::summarize(Mean = mean(log2fc, na.rm = TRUE), SD = sd(log2fc, na.rm = TRUE))
+
+
+#perform t-test
+ttest_results <- data.frame(Target = character(),
+                      pvalue = numeric(),
+                      t = numeric())
+                    
+for (i in 1:58){
+
+  tar <- ttest_data[i,"Target"]
+  tar <- as.character(tar)
+  dtscatter1 <- ttest_data[ttest_data$Target == tar,]
+  
+  ttest <- t.test(log2fc ~ group, data = dtscatter1)
+  p_value <- ttest$p.value
+  t_value <- ttest$statistic
+
+  new_row <- data.frame(Target = tar, pvalue = p_value, t = t_value)
+  ttest_results <- rbind(ttest_results, new_row)
+}
+
+ttest_results
+
+```
+
+
+
+# Principal Component Analysis (PCA)
+```{r}
+## get data
+pca_data <- heatmapdt_cq_plasma[,-(10:20)]
+
+## set Values with "0" to the mean of that miRNA
+pca_data[pca_data == 0] <- NA
+pca_data<- t(apply(pca_data, 1, function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))))
+
+## perform PCA
+pca_model <- prcomp(t(pca_data), scale=TRUE) 
+
+## make a scree plot
+pca.var <- pca_model$sdev^2
+pca.var.per <- round(pca.var/sum(pca.var)*100, 1)
+barplot(pca.var.per, main="Scree Plot", xlab="Principal Component", ylab="Percent Variation", col = "#1f3a6f")
+
+## Create PCA Plot with ggplot:
+pca.data <- data.frame(Sample=rownames(pca_model$x),
+  X=pca_model$x[,1],
+  Y=pca_model$x[,2],
+  group=factor(rep(c("LRRK2", "sPD"), c(9,10)))
+  )
+
+pca.plot <- ggplot(data=pca.data, aes(x=X, y=Y, label=Sample, color = group)) +
+  geom_point(size=1.3) +
+  stat_ellipse(level = 0.95)+
+  xlab(paste("PC1 - ", pca.var.per[1], "%", sep="")) +
+  ylab(paste("PC2 - ", pca.var.per[2], "%", sep="")) +
+  scale_color_manual(values=c("#0C5196", "#E23126")) +
+  theme_minimal() +
+  theme(text = element_text(size=10))
+
+pca.plot
+ 
+## get the name of the top 10 miRNAs that contribute most to PC1
+loading_scores <- pca_model$rotation[,1]
+scores <- abs(loading_scores) ## get the magnitudes
+score_ranked <- sort(scores, decreasing=TRUE)
+top_10 <- names(score_ranked[1:10])
+
+print("10 miRNAs that contribute most to PC1:")
+top_10
+
+```
+
+
+# Random Forest
+
+```{r}
+## get data
+forest_data <- as.data.frame(t(heatmapdt_cq_plasma [,-(10:20)]))
+forest_data[forest_data == 0] <- NA
+colnames(forest_data) <- gsub("[-_]", ".", colnames(forest_data))
+colnames(forest_data)<- paste0("X_", colnames(forest_data))
+
+
+##add condition
+forest_data$condition <- NA
+forest_data$condition[1:9] <- "fPD"
+forest_data$condition[10:19] <- "sPD"
+forest_data$condition <- as.factor(forest_data$condition)
+
+set.seed(42)
+
+## impute any missing values
+forest_data.imputed <- rfImpute(condition ~ ., data = forest_data, iter=6)
+
+forest_model <- randomForest(condition ~ ., data=forest_data.imputed, ntree=200, proximity=TRUE, importance = F)
+forest_model
+
+
+## Graph for OOB error depending on amount of trees
+oob.error.data <- data.frame(
+  Trees=rep(1:nrow(forest_model$err.rate), times=3),
+  Type=rep(c("all OOB", "fPD OOB", "sPD OOB"), each=nrow(forest_model$err.rate)),
+  Error=c(forest_model$err.rate[,"OOB"], 
+    forest_model$err.rate[,"fPD"], 
+    forest_model$err.rate[,"sPD"]))
+
+ggplot(data=oob.error.data, aes(x=Trees, y=Error)) +
+  geom_line(aes(color=Type))+
+  scale_color_manual(values=c("fPD OOB" = "#0C5196", "all OOB"= "#bbbbbb", "sPD OOB"= "#E23126"))
+
+
+## VarImportance Plot
+varImpPlot(forest_model, type = 2, n.var = 15, main = "Importance of variables")
+
+##Proximity Heatmap
+heatmapdata <- forest_model$proximity
+colnames(heatmapdata) = c("22: asymp", "28: asymp", "31:asymp",  "1: G2019S", "4: G2019S", "7: R1441C", "10: I2020T", "13: G2019S", "16: G2019S", "2: sPD", "5: sPD", "8: sPD", "11: sPD", "14: sPD", "17: sPD", "20: sPD", "23: sPD", "26: sPD", "29: sPD")
+rownames(heatmapdata) <- colnames (heatmapdata)
+annotation_col = data.frame(
+    group = factor(rep(c("LRRK2", "sPD"), c(9,10)))
+)
+rownames(annotation_col) = colnames(heatmapdata)
+ann_colors = list(group = c("sPD" = "#E23126", "LRRK2" = "#0C5196"))
+
+pheatmap(heatmapdata,
+         cluster_rows = T,
+         cluster_cols = T,
+         annotation_col = annotation_col,
+         annotation_row = annotation_col,
+         annotation_colors = ann_colors,
+         fontsize = 13,
+         cellheight = 8,
+         cellwidth = 8,
+         border_color = NA,
+         display_numbers = F,
+         show_rownames = F,
+         show_colnames = F,
+         treeheight_col = 20,
+         treeheight_row = 20,
+         color=colorRampPalette(c("white", "darkred"))(100),
+         #breaks = seq(-2.5, 2.5, by = 0.5),
+         heatmap_legend_param = list(
+              title = "Proximity",
+              legend_height = unit(2, "cm")
+              #title_position = "lefttop-rot"
+          )
+         )
+
+```
+
+
+# LASSO Regression
+```{r, warning=FALSE}
+## get data
+lasso_data <- forest_data
+
+## set NA to Mean value of that miRNA
+for (i in 1:59){
+  lasso_data[,i][is.na(lasso_data[,i])] <- mean(lasso_data[,i], na.rm = TRUE)
+}
+
+## perform Lasso
+lambda.values <- 10^seq(-3, 3, length = 100)
+set.seed(123)
+train.control.lasso <- trainControl(method="LOOCV")
+
+lasso_model <- train(condition ~ ., data = lasso_data, method = "glmnet", trControl = train.control.lasso, family = "binomial",
+               tuneGrid = expand.grid(alpha=1, lambda = lambda.values)
+               )
+
+print(lasso_model)
+coef(lasso_model$finalModel, lasso_model$bestTune$lambda)
+varImp(lasso_model)
+
+finallambda <- lasso_model$bestTune$lambda
+
+
+## Confusion Matrix
+y <- lasso_data$condition
+x <- lasso_data[,-59]
+x<- as.matrix(x)
+
+lasso_predictions <- matrix(NA, nrow = length(y), ncol = 2,
+                      dimnames = list(NULL, c("Predicted", "Actual")))
+
+for (i in 1:length(y)) {
+  # Select the current sample for testing
+  X_test <- x[i, ]
+  y_test <- y[i]
+  
+  # Remove the current sample from the training set
+  X_train <- x[-i, ]
+  y_train <- y[-i]
+  
+  # Fit the Lasso regression model
+  lasso_model_X <- glmnet(X_train, y_train, family = "binomial", alpha = 1, type.measure = 'class', lambda = finallambda)
+  
+  # Make predictions on the test sample
+  y_pred_X <- predict(lasso_model_X, newx = X_test, type = "response")
+  
+  # Store the predicted label and true label in the matrix
+  lasso_predictions[i, "Predicted"] <- ifelse(y_pred_X > 0.5, "sPD", "fPD")
+  lasso_predictions[i, "Actual"] <- y_test
+}
+
+lasso_predictions[, 2] <- ifelse(lasso_predictions[, 2] == "1", "fPD", "sPD")
+
+confusion_X <- confusionMatrix(data = factor(lasso_predictions[, "Predicted"], levels = c("fPD", "sPD")),
+                             reference = factor(lasso_predictions[, "Actual"], levels = c("fPD", "sPD")))
+
+print(confusion_X)
+
+
+```
+
+
+
